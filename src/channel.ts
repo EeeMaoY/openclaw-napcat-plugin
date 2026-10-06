@@ -12,7 +12,13 @@ import {
 import { buildNapCatMediaCq, isAudioMedia, redactNapCatMediaForLog, resolveLocalFilePath } from "./media.js";
 import { formatNapCatOutgoingText } from "./plainText.js";
 import { resolveNapCatEmojiId } from "./reactions.js";
-import { getNapCatGroupReplyMentionUser, setNapCatConfig } from "./runtime.js";
+import {
+    getNapCatGroupReplyMentionUser,
+    getNapCatGroupReplyMessageId,
+    isNapCatGroupQuoteReplyEnabled,
+    resolveNapCatConversationConfig,
+    setNapCatConfig,
+} from "./runtime.js";
 
 const recentTextDeliveries = new Map<string, {
     expiresAt: number;
@@ -44,8 +50,25 @@ async function sendToNapCat(url: string, payload: any, token?: string) {
     return await res.json();
 }
 
-function withActiveGroupMention(message: string, targetType: string, targetId: string): string {
+function withActiveGroupReplyPrefix(
+    message: string,
+    targetType: string,
+    targetId: string,
+    config: any
+): string {
     if (targetType !== "group" || !message) return message;
+
+    // Quote the triggering message when we still have its id, otherwise fall back to the
+    // @ mention so a group reply is never sent with no addressing at all.
+    if (isNapCatGroupQuoteReplyEnabled(config)) {
+        const quoteMessageId = String(getNapCatGroupReplyMessageId(targetId) || "").trim();
+        if (/^\d+$/.test(quoteMessageId)) {
+            const reply = `[CQ:reply,id=${quoteMessageId}]`;
+            if (message.includes(reply)) return message;
+            return `${reply} ${message}`;
+        }
+    }
+
     const mentionUserId = getNapCatGroupReplyMentionUser(targetId);
     if (!mentionUserId) return message;
     const mention = `[CQ:at,qq=${mentionUserId}]`;
@@ -382,6 +405,18 @@ export const napcatPlugin = {
                 description: "Send assistant intermediate progress (commentary) messages to QQ as well, throttled to 1 per 3s per conversation",
                 default: false
             },
+            groupReplyQuote: {
+                type: "boolean",
+                title: "Quote Reply in Groups",
+                description: "In group chats, reply by quoting the triggering message ([CQ:reply]) instead of @-mentioning the sender. Off by default; overridable per conversation",
+                default: false
+            },
+            conversationConfigDir: {
+                type: "string",
+                title: "Per-Conversation Config Directory",
+                description: "Directory of per-conversation JSON overrides (default.json plus <group|private>-<id>.json). A missing directory disables the feature",
+                default: "~/.openclaw/napcat/conversations"
+            },
             plainTextMode: {
                 type: "boolean",
                 title: "Plain Text Mode",
@@ -528,10 +563,12 @@ export const napcatPlugin = {
             }
 
             const endpoint = targetType === "group" ? "/send_group_msg" : "/send_private_msg";
-            const message = withActiveGroupMention(
-                formatNapCatOutgoingText(text, config),
+            const convConfig = resolveNapCatConversationConfig(config, `${targetType}:${targetId}`);
+            const message = withActiveGroupReplyPrefix(
+                formatNapCatOutgoingText(text, convConfig),
                 targetType,
                 targetId,
+                convConfig
             );
             const payload: any = { message };
             if (targetType === "group") payload.group_id = targetId;
@@ -611,10 +648,12 @@ export const napcatPlugin = {
                     })}`);
                     const uploadResult = await uploadGroupFileToNapCat(`${baseUrl}/upload_group_file`, uploadPayload, token);
 
-                    const plainText = withActiveGroupMention(
-                        formatNapCatOutgoingText(text || "", config),
+                    const convConfig = resolveNapCatConversationConfig(config, `${targetType}:${targetId}`);
+                    const plainText = withActiveGroupReplyPrefix(
+                        formatNapCatOutgoingText(text || "", convConfig),
                         targetType,
                         targetId,
+                        convConfig
                     );
                     if (plainText && plainText.trim()) {
                         await sendToNapCat(`${baseUrl}${endpoint}`, {
@@ -649,11 +688,12 @@ export const napcatPlugin = {
             const mediaMessage = mediaUrl
                 ? await buildNapCatMediaCq(mediaUrl, config)
                 : "";
-            const plainText = formatNapCatOutgoingText(text || "", config);
+            const convConfig = resolveNapCatConversationConfig(config, `${targetType}:${targetId}`);
+            const plainText = formatNapCatOutgoingText(text || "", convConfig);
             const messageWithoutMention = plainText
                 ? (mediaMessage ? `${plainText}\n${mediaMessage}` : plainText)
                 : (mediaMessage || "");
-            const message = withActiveGroupMention(messageWithoutMention, targetType, targetId);
+            const message = withActiveGroupReplyPrefix(messageWithoutMention, targetType, targetId, convConfig);
 
             const payload: any = { message };
             if (targetType === "group") payload.group_id = targetId;
