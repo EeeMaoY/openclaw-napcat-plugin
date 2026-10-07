@@ -10,16 +10,74 @@ let _config: any = {};
 // enqueued and the agent run happens later, so tearing the entry down on return removed the
 // context before the run that needed it had even started -- and that run's replies then went
 // out with neither a quote nor an @.
-const activeGroupReplyContexts = new Map<string, Array<{
+type NapCatGroupReplyEntry = {
   senderId: string;
   messageId?: string;
   token: symbol;
   expiresAt: number;
-}>>();
+};
 
-// Bounds the map for groups that go quiet: entries are pruned lazily, so a group that never
-// sees another message would otherwise keep its entries forever.
+const activeGroupReplyContexts = new Map<string, NapCatGroupReplyEntry[]>();
+
+// Running total of entries across every group, maintained by the helpers below so the bounds
+// can be enforced in O(1) instead of by rescanning the map.
+let activeGroupReplyEntryCount = 0;
+
+// Three bounds, because each one alone leaks: the group count caps a burst of distinct
+// groups, the per-group entry cap keeps one busy group from growing without bound, and the
+// total caps the product of the two. Expired entries form a prefix of each group's array
+// (they are appended in non-decreasing expiry order), so pruning them is a prefix removal
+// rather than the full-array scan this used to do on every insert and every lookup.
 const GROUP_CONTEXT_LIMIT = 500;
+const GROUP_ENTRY_LIMIT = 8;
+const TOTAL_ENTRY_LIMIT = 2000;
+const GROUP_CONTEXT_TTL_MS = 10 * 60 * 1000;
+const GROUP_CONTEXT_SWEEP_INTERVAL_MS = 30_000;
+
+function dropNapCatGroupReplyContext(groupId: string): void {
+  const entries = activeGroupReplyContexts.get(groupId);
+  if (!entries) return;
+  activeGroupReplyEntryCount -= entries.length;
+  activeGroupReplyContexts.delete(groupId);
+}
+
+function pruneExpiredGroupReplyEntries(entries: NapCatGroupReplyEntry[], now: number): void {
+  let expired = 0;
+  while (expired < entries.length && entries[expired].expiresAt <= now) expired += 1;
+  if (expired === 0) return;
+  entries.splice(0, expired);
+  activeGroupReplyEntryCount -= expired;
+}
+
+// Reclaims groups that have gone quiet. Lazy pruning only runs when the same group is touched
+// again, which for a group that stops receiving messages never happens, so the entries would
+// sit in the map forever. Called on a timer and directly by tests.
+export function sweepNapCatGroupReplyContexts(now: number = Date.now()): void {
+  for (const [groupId, entries] of [...activeGroupReplyContexts]) {
+    pruneExpiredGroupReplyEntries(entries, now);
+    if (entries.length === 0) dropNapCatGroupReplyContext(groupId);
+  }
+
+  while (activeGroupReplyEntryCount > TOTAL_ENTRY_LIMIT && activeGroupReplyContexts.size > 0) {
+    const oldest = activeGroupReplyContexts.keys().next().value;
+    if (oldest === undefined) break;
+    dropNapCatGroupReplyContext(oldest);
+  }
+}
+
+// Started from the plugin's gateway hook and stopped when the account aborts, so importing
+// this module never leaves a timer running behind the caller's back.
+export function startNapCatGroupReplyContextSweeper(): () => void {
+  const timer = setInterval(() => sweepNapCatGroupReplyContexts(), GROUP_CONTEXT_SWEEP_INTERVAL_MS);
+  // The sweep must never be the reason the process stays alive.
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+// Exposed so tests can assert the bounds hold rather than inferring them from behaviour.
+export function getNapCatGroupReplyContextStats(): { groupCount: number; entryCount: number } {
+  return { groupCount: activeGroupReplyContexts.size, entryCount: activeGroupReplyEntryCount };
+}
 
 export function setNapCatRuntime(runtime: any) {
   _runtime = runtime;
@@ -171,52 +229,74 @@ export function beginNapCatGroupReplyContext(
   const token = Symbol(`napcat-group-reply:${normalizedGroupId}`);
   const now = Date.now();
 
-  let entries = activeGroupReplyContexts.get(normalizedGroupId) || [];
-  if (entries.length > 0) {
-    entries = entries.filter((entry) => entry.expiresAt > now);
-    if (entries.length === 0) activeGroupReplyContexts.delete(normalizedGroupId);
+  let entries = activeGroupReplyContexts.get(normalizedGroupId);
+  if (entries) {
+    pruneExpiredGroupReplyEntries(entries, now);
+    // Drop the group once its last entry expired, so the group count reflects groups with a
+    // live turn rather than every group ever seen.
+    if (entries.length === 0) {
+      dropNapCatGroupReplyContext(normalizedGroupId);
+      entries = undefined;
+    }
   }
 
-  if (!activeGroupReplyContexts.has(normalizedGroupId) && activeGroupReplyContexts.size >= GROUP_CONTEXT_LIMIT) {
-    const oldest = activeGroupReplyContexts.keys().next().value;
-    if (oldest !== undefined) activeGroupReplyContexts.delete(oldest);
+  if (!entries) {
+    if (activeGroupReplyContexts.size >= GROUP_CONTEXT_LIMIT) {
+      const oldest = activeGroupReplyContexts.keys().next().value;
+      if (oldest !== undefined) dropNapCatGroupReplyContext(oldest);
+    }
+    entries = [];
+    activeGroupReplyContexts.set(normalizedGroupId, entries);
   }
 
   entries.push({
     senderId: normalizedSenderId,
     messageId: /^\d+$/.test(normalizedMessageId) ? normalizedMessageId : undefined,
     token,
-    expiresAt: now + 10 * 60 * 1000,
+    expiresAt: now + GROUP_CONTEXT_TTL_MS,
   });
-  activeGroupReplyContexts.set(normalizedGroupId, entries);
+  activeGroupReplyEntryCount += 1;
+
+  // Only the newest few turns can plausibly own an outbound send, so the oldest are dropped
+  // rather than kept until they expire.
+  const excess = entries.length - GROUP_ENTRY_LIMIT;
+  if (excess > 0) {
+    entries.splice(0, excess);
+    activeGroupReplyEntryCount -= excess;
+  }
+
   return token;
 }
 
-// Most recent still-live turn for the group. Two overlapping turns are genuinely ambiguous
-// from the outbound side (the message tool knows the group, not which turn called it), so this
-// keeps the previous "latest wins" behaviour -- it must merely never return nothing while some
-// turn is still live.
-function mostRecentGroupReplyContext(groupId: string) {
+// The turn a send belongs to, identified by the message id it answers. Core hands that id to
+// the outbound path (ctx.replyToId, sourced from this turn's MessageSid), so an exact match is
+// what scopes a reply to its own turn. The previous "latest entry for the group" lookup could
+// not: for the whole TTL window it handed every unrelated send to the group -- an announcement,
+// a proactive message -- the prefix of a turn that had already finished.
+function findGroupReplyContext(groupId: string, messageId: string): NapCatGroupReplyEntry | undefined {
   const normalizedGroupId = String(groupId || "").trim();
+  const normalizedMessageId = String(messageId ?? "").trim();
+  if (!/^\d+$/.test(normalizedMessageId)) return undefined;
+
   const entries = activeGroupReplyContexts.get(normalizedGroupId);
   if (!entries || entries.length === 0) return undefined;
 
-  const now = Date.now();
-  const live = entries.filter((entry) => entry.expiresAt > now);
-  if (live.length !== entries.length) {
-    if (live.length > 0) activeGroupReplyContexts.set(normalizedGroupId, live);
-    else activeGroupReplyContexts.delete(normalizedGroupId);
+  pruneExpiredGroupReplyEntries(entries, Date.now());
+  if (entries.length === 0) {
+    dropNapCatGroupReplyContext(normalizedGroupId);
+    return undefined;
   }
-  return live[live.length - 1];
+
+  // Newest first: if the same message id were registered twice, the later turn's sender wins.
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i].messageId === normalizedMessageId) return entries[i];
+  }
+  return undefined;
 }
 
-export function getNapCatGroupReplyMentionUser(groupId: string): string | undefined {
-  return mostRecentGroupReplyContext(groupId)?.senderId;
-}
-
-// Shares the mention user's 10 minute window rather than a shorter one of its own: agent
-// turns routinely run for minutes, and expiring the quote earlier would make replies @
-// instead of quote depending on how long the turn happened to take.
-export function getNapCatGroupReplyMessageId(groupId: string): string | undefined {
-  return mostRecentGroupReplyContext(groupId)?.messageId;
+// Only the sender is looked up this way. A quote id comes straight from core's replyToId, but
+// that carries no sender, so the @ fallback (groupReplyQuote: false) still needs the turn that
+// registered this message. An id nobody registered yields nothing rather than a guess.
+export function getNapCatGroupReplySender(groupId: string, messageId: string): string | undefined {
+  return findGroupReplyContext(groupId, messageId)?.senderId;
 }

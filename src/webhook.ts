@@ -1,11 +1,10 @@
-import { Agent as HttpAgent, request as httpRequest } from "node:http";
-import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { resolveAckReaction } from "openclaw/plugin-sdk/channel-feedback";
 import { buildNapCatMediaCq, redactNapCatMediaForLog } from "./media.js";
 import { loadMediaProxyResource, MediaProxyError, mediaProxyTokensMatch } from "./mediaProxy.js";
+import { sendNapCatMessage, sendToNapCat } from "./napcatApi.js";
 import { formatNapCatOutgoingText } from "./plainText.js";
 import { resolveNapCatEmojiId, shouldSendNapCatAckReaction } from "./reactions.js";
 import {
@@ -16,12 +15,11 @@ import {
     resolveNapCatConversationConfig,
 } from "./runtime.js";
 
+// Re-exported so callers can keep reaching for the sender through this module.
+export { sendToNapCat };
+
 // Group name cache removed
 
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function isNapCatStreamingModeEnabled(config: any): boolean {
     return config?.streaming_mode === true;
@@ -142,185 +140,6 @@ function createPrivateTypingStatusController(options: {
             }
         }
     };
-}
-
-const napcatHttpAgent = new HttpAgent({
-    keepAlive: true,
-    keepAliveMsecs: 10000,
-    maxSockets: 20,
-    maxFreeSockets: 10,
-});
-
-const napcatHttpsAgent = new HttpsAgent({
-    keepAlive: true,
-    keepAliveMsecs: 10000,
-    maxSockets: 20,
-    maxFreeSockets: 10,
-});
-
-function isRetryableNapCatError(err: any): boolean {
-    const code = String(err?.cause?.code || err?.code || "");
-    return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "ECONNABORTED"].includes(code);
-}
-
-function isNapCatFailedResponse(result: any): boolean {
-    return result?.status === "failed" ||
-        Number(result?.retcode || 0) !== 0 ||
-        result?.data?.status === "failed" ||
-        Number(result?.data?.retcode || 0) !== 0;
-}
-
-async function postJsonWithNodeHttp(
-    url: string,
-    payload: any,
-    timeoutMs: number,
-    opts?: { connectionClose?: boolean; token?: string }
-): Promise<{ statusCode: number; statusText: string; bodyText: string }> {
-    const target = new URL(url);
-    const isHttps = target.protocol === "https:";
-    const body = JSON.stringify(payload);
-    const transport = isHttps ? httpsRequest : httpRequest;
-    const connectionClose = opts?.connectionClose === true;
-    const normalizedToken = String(opts?.token ?? "").trim();
-    const agent = connectionClose ? undefined : (isHttps ? napcatHttpsAgent : napcatHttpAgent);
-
-    return new Promise((resolve, reject) => {
-        const headers: Record<string, string | number> = {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-            "Connection": connectionClose ? "close" : "keep-alive",
-        };
-        if (normalizedToken) {
-            headers["Authorization"] = `Bearer ${normalizedToken}`;
-        }
-        const req = transport(
-            {
-                protocol: target.protocol,
-                hostname: target.hostname,
-                port: target.port || (isHttps ? 443 : 80),
-                path: `${target.pathname}${target.search}`,
-                method: "POST",
-                agent,
-                headers,
-            },
-            (res) => {
-                const chunks: Buffer[] = [];
-                res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-                res.on("end", () => {
-                    const bodyText = Buffer.concat(chunks).toString("utf8");
-                    resolve({
-                        statusCode: res.statusCode || 0,
-                        statusText: res.statusMessage || "",
-                        bodyText,
-                    });
-                });
-            }
-        );
-
-        req.setTimeout(timeoutMs, () => {
-            req.destroy(Object.assign(new Error(`NapCat request timeout after ${timeoutMs}ms`), { code: "ETIMEDOUT" }));
-        });
-
-        req.on("error", reject);
-        req.write(body);
-        req.end();
-    });
-}
-
-type SendToNapCatOptions = {
-    /**
-     * Retries are safe for reads and idempotent actions, but must be disabled
-     * for message sends: NapCat may have accepted the message even when the
-     * HTTP response is lost, and retrying would send the same message again.
-     */
-    allowRetry?: boolean;
-};
-
-// Call the NapCat API using node http/https. Transient retries are opt-out so
-// existing read/idempotent callers retain their previous behavior.
-export async function sendToNapCat(
-    url: string,
-    payload: any,
-    token?: string,
-    options: SendToNapCatOptions = {}
-) {
-    const maxAttempts = options.allowRetry === false ? 1 : 3;
-    const timeoutsMs = [5000, 7000, 9000];
-    const cfg = getNapCatConfig();
-    const connectionClose = cfg.connectionClose !== false; // default true for local docker stability
-    const target = new URL(url);
-    const targetInfo = `${target.protocol}//${target.hostname}:${target.port || (target.protocol === "https:" ? "443" : "80")}${target.pathname}`;
-
-    let lastErr: any = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const startedAt = Date.now();
-        try {
-            const timeoutMs = timeoutsMs[Math.min(attempt - 1, timeoutsMs.length - 1)];
-            const res = await postJsonWithNodeHttp(url, payload, timeoutMs, { connectionClose, token });
-
-            if (res.statusCode < 200 || res.statusCode >= 300) {
-                throw new Error(`NapCat API Error: ${res.statusCode} ${res.statusText}${res.bodyText ? ` | ${res.bodyText.slice(0, 300)}` : ""}`);
-            }
-
-            const elapsedMs = Date.now() - startedAt;
-            console.log(`[NapCat] sendToNapCat success attempt ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms (connection=${connectionClose ? "close" : "keep-alive"})`);
-
-            if (!res.bodyText) return { status: "ok" };
-            let parsed: any;
-            try {
-                parsed = JSON.parse(res.bodyText);
-            } catch {
-                return { status: "ok", raw: res.bodyText };
-            }
-            if (isNapCatFailedResponse(parsed)) {
-                throw new Error(`NapCat API returned failure: ${res.bodyText.slice(0, 300)}`);
-            }
-            return parsed;
-        } catch (err: any) {
-            lastErr = err;
-            const retryable = isRetryableNapCatError(err);
-            const elapsedMs = Date.now() - startedAt;
-            if (!retryable || attempt >= maxAttempts) {
-                console.error(`[NapCat] sendToNapCat failed attempt ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms: ${err?.cause?.code || err?.code || err}`);
-                break;
-            }
-            const backoffMs = attempt * 400;
-            console.warn(`[NapCat] sendToNapCat retry ${attempt}/${maxAttempts} ${targetInfo} in ${elapsedMs}ms; backoff ${backoffMs}ms; reason=${err?.cause?.code || err?.code || err}`);
-            await sleep(backoffMs);
-        }
-    }
-
-    throw lastErr;
-}
-
-// A rejected [CQ:reply] id would otherwise drop the whole reply: sends run with
-// allowRetry:false and the deliver callback only logs the failure. Re-send once with the
-// quote prefix stripped so the message still lands, just without the quote.
-const NAPCAT_QUOTE_PREFIX_RE = /^\[CQ:reply,id=\d+\]\s*/;
-
-async function sendNapCatReplyWithQuoteFallback(
-    baseUrl: string,
-    endpoint: string,
-    msgPayload: Record<string, string>,
-    token: string,
-    message: string
-): Promise<void> {
-    try {
-        await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload, token, { allowRetry: false });
-        console.log("[NapCat] Reply sent successfully");
-        return;
-    } catch (err) {
-        if (!NAPCAT_QUOTE_PREFIX_RE.test(message)) throw err;
-        console.warn("[NapCat] Quote-reply send failed; retrying without [CQ:reply]:", err);
-    }
-
-    await sendToNapCat(
-        `${baseUrl}${endpoint}`,
-        { ...msgPayload, message: message.replace(NAPCAT_QUOTE_PREFIX_RE, "") },
-        token,
-        { allowRetry: false }
-    );
-    console.log("[NapCat] Reply sent successfully (quote stripped)");
 }
 
 export async function buildNapCatMessageFromReply(
@@ -1066,7 +885,7 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         
                         console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${redactNapCatMediaForLog(message).substring(0, 50)}...`);
                         try {
-                            await sendNapCatReplyWithQuoteFallback(baseUrl, endpoint, msgPayload, token, message);
+                            await sendNapCatMessage(`${baseUrl}${endpoint}`, msgPayload, token);
                         } catch (err) {
                             console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
                         }
@@ -1123,7 +942,7 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
                         
                         console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${redactNapCatMediaForLog(message).substring(0, 50)}...`);
                         try {
-                            await sendNapCatReplyWithQuoteFallback(baseUrl, endpoint, msgPayload, token, message);
+                            await sendNapCatMessage(`${baseUrl}${endpoint}`, msgPayload, token);
                         } catch (err) {
                             console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
                         }
@@ -1146,11 +965,13 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
             console.log("[NapCat] Dispatcher created, methods:", Object.keys(dispatcher));
 
             // Codex source-channel replies use the message tool, which bypasses the dispatcher
-            // deliver callback, so the outbound adapter reads the triggering message from here.
-            // The entry is left to expire rather than removed when this handler returns: under
-            // queue mode "followup" the handler returns as soon as the message is enqueued while
-            // the agent run happens later, so a teardown here would drop the context before the
-            // run that needs it even starts.
+            // deliver callback, so the outbound adapter looks the turn's sender up here. It is
+            // the only place that sender is known: core hands the adapter the triggering
+            // message's id (ctx.replyToId) but never who sent it, and the @ fallback used when
+            // groupReplyQuote is off needs the sender. The entry is left to expire rather than
+            // removed when this handler returns: under queue mode "followup" the handler returns
+            // as soon as the message is enqueued while the agent run happens later, so a
+            // teardown here would drop the context before the run that needs it even starts.
             if (isGroup) {
                 beginNapCatGroupReplyContext(groupId, senderId, messageId);
             }

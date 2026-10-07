@@ -10,14 +10,15 @@ import {
     resolveReactionMessageId,
 } from "openclaw/plugin-sdk/channel-actions";
 import { buildNapCatMediaCq, isAudioMedia, redactNapCatMediaForLog, resolveLocalFilePath } from "./media.js";
+import { NapCatBusinessError, sendNapCatMessage, sendToNapCat } from "./napcatApi.js";
 import { formatNapCatOutgoingText } from "./plainText.js";
 import { resolveNapCatEmojiId } from "./reactions.js";
 import {
-    getNapCatGroupReplyMentionUser,
-    getNapCatGroupReplyMessageId,
+    getNapCatGroupReplySender,
     isNapCatGroupQuoteReplyEnabled,
     resolveNapCatConversationConfig,
     setNapCatConfig,
+    startNapCatGroupReplyContextSweeper,
 } from "./runtime.js";
 
 const recentTextDeliveries = new Map<string, {
@@ -27,50 +28,34 @@ const recentTextDeliveries = new Map<string, {
 const RECENT_TEXT_DELIVERY_TTL_MS = 15_000;
 let fallbackMessageIdSequence = 0;
 
-async function sendToNapCat(url: string, payload: any, token?: string) {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    const normalizedToken = String(token ?? "").trim();
-    if (normalizedToken) {
-        headers["Authorization"] = `Bearer ${normalizedToken}`;
-    }
-    const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-        let body = "";
-        try {
-            body = await res.text();
-        } catch {
-            body = "";
-        }
-        throw new Error(`NapCat API Error: ${res.status} ${res.statusText}${body ? ` | body=${body}` : ""}`);
-    }
-    return await res.json();
-}
-
+// Addresses a group send to the turn it answers. The turn is identified by the id core attaches
+// to the send (ctx.replyToId): an inbound message that triggered this reply, or an id the agent
+// named explicitly. Without one this is not a reply to any turn -- a scheduled announcement, a
+// proactive message -- and goes out with no prefix, even if a turn for the same group ended
+// moments ago. That is the whole point: addressing must not outlive the turn that produced it.
 function withActiveGroupReplyPrefix(
     message: string,
     targetType: string,
     targetId: string,
-    config: any
+    config: any,
+    replyToId?: string
 ): string {
     if (targetType !== "group" || !message) return message;
 
-    // Quote the triggering message when we still have its id, otherwise fall back to the
-    // @ mention so a group reply is never sent with no addressing at all.
+    const triggerMessageId = String(replyToId ?? "").trim();
+    if (!/^\d+$/.test(triggerMessageId)) return message;
+
     if (isNapCatGroupQuoteReplyEnabled(config)) {
-        const quoteMessageId = String(getNapCatGroupReplyMessageId(targetId) || "").trim();
-        if (/^\d+$/.test(quoteMessageId)) {
-            const reply = `[CQ:reply,id=${quoteMessageId}]`;
-            if (message.includes(reply)) return message;
-            return `${reply} ${message}`;
-        }
+        const reply = `[CQ:reply,id=${triggerMessageId}]`;
+        if (message.includes(reply)) return message;
+        return `${reply} ${message}`;
     }
 
-    const mentionUserId = getNapCatGroupReplyMentionUser(targetId);
-    if (!mentionUserId) return message;
+    // groupReplyQuote is off for this conversation, so @ the sender of that same turn. Core's id
+    // carries no sender, so it comes from the context registered under this message id -- and
+    // only from there. An id nobody registered yields no prefix rather than the wrong person.
+    const mentionUserId = String(getNapCatGroupReplySender(targetId, triggerMessageId) || "").trim();
+    if (!/^\d+$/.test(mentionUserId)) return message;
     const mention = `[CQ:at,qq=${mentionUserId}]`;
     if (message.includes(mention)) return message;
     return `${mention} ${message}`;
@@ -120,7 +105,9 @@ async function sendTextToNapCatOnce(
         return existing.promise;
     }
 
-    const promise = sendToNapCat(url, payload, token);
+    // Message sends are non-idempotent, so allowRetry stays off inside the sender and a
+    // rejected quote is degraded there rather than by resending this same payload.
+    const promise = sendNapCatMessage(url, payload, token);
     recentTextDeliveries.set(deliveryKey, {
         expiresAt: now + RECENT_TEXT_DELIVERY_TTL_MS,
         promise,
@@ -149,7 +136,8 @@ async function uploadGroupFileToNapCat(url: string, payload: {
     if (payload.folder) {
         requestPayload.folder = payload.folder;
     }
-    return await sendToNapCat(url, requestPayload, token);
+    // Uploading the same file twice produces two group files, so this must never be retried.
+    return await sendToNapCat(url, requestPayload, token, { allowRetry: false });
 }
 
 async function ensureReadableFile(filePath: string): Promise<void> {
@@ -304,13 +292,18 @@ export const napcatMessageActions: ChannelMessageActionAdapter = {
         const baseUrl = config.url || "http://127.0.0.1:15150";
         const token = String(config.token || "").trim();
 
-        const result = await sendToNapCat(`${baseUrl}/set_msg_emoji_like`, {
-            message_id: String(messageId),
-            emoji_id: emojiId,
-            set: !remove,
-        }, token);
-
-        if (result?.status === "failed" || Number(result?.retcode || 0) !== 0) {
+        // The sender now rejects on a NapCat-level failure instead of handing back the failed
+        // body, so the structured "do not retry" hint is produced here rather than from a
+        // post-hoc check on the result. A rejected reaction is a legitimate answer for the
+        // agent, not an exception, so only business failures are converted.
+        try {
+            await sendToNapCat(`${baseUrl}/set_msg_emoji_like`, {
+                message_id: String(messageId),
+                emoji_id: emojiId,
+                set: !remove,
+            }, token);
+        } catch (err) {
+            if (!(err instanceof NapCatBusinessError)) throw err;
             return jsonResult({
                 ok: false,
                 reason: "reaction_failed",
@@ -534,7 +527,7 @@ export const napcatPlugin = {
     },
     outbound: {
         deliveryMode: "direct",
-        sendText: async ({ to, text, cfg }: any) => {
+        sendText: async ({ to, text, cfg, replyToId }: any) => {
             const config = cfg.channels?.napcat || {};
             const baseUrl = config.url || "http://127.0.0.1:15150";
             const token = String(config.token || "").trim();
@@ -568,7 +561,8 @@ export const napcatPlugin = {
                 formatNapCatOutgoingText(text, convConfig),
                 targetType,
                 targetId,
-                convConfig
+                convConfig,
+                replyToId
             );
             const payload: any = { message };
             if (targetType === "group") payload.group_id = targetId;
@@ -585,7 +579,7 @@ export const napcatPlugin = {
             );
             return toOutboundDeliveryResult(result, targetId);
         },
-        sendMedia: async ({ to, text, mediaUrl, cfg }: any) => {
+        sendMedia: async ({ to, text, mediaUrl, cfg, replyToId }: any) => {
             const config = cfg.channels?.napcat || {};
             const baseUrl = config.url || "http://127.0.0.1:15150";
             const token = String(config.token || "").trim();
@@ -653,10 +647,11 @@ export const napcatPlugin = {
                         formatNapCatOutgoingText(text || "", convConfig),
                         targetType,
                         targetId,
-                        convConfig
+                        convConfig,
+                        replyToId
                     );
                     if (plainText && plainText.trim()) {
-                        await sendToNapCat(`${baseUrl}${endpoint}`, {
+                        await sendNapCatMessage(`${baseUrl}${endpoint}`, {
                             group_id: targetId,
                             message: plainText,
                         }, token);
@@ -693,7 +688,7 @@ export const napcatPlugin = {
             const messageWithoutMention = plainText
                 ? (mediaMessage ? `${plainText}\n${mediaMessage}` : plainText)
                 : (mediaMessage || "");
-            const message = withActiveGroupReplyPrefix(messageWithoutMention, targetType, targetId, convConfig);
+            const message = withActiveGroupReplyPrefix(messageWithoutMention, targetType, targetId, convConfig, replyToId);
 
             const payload: any = { message };
             if (targetType === "group") payload.group_id = targetId;
@@ -715,7 +710,11 @@ export const napcatPlugin = {
         startAccount: async (ctx?: any) => {
             ctx?.log?.info?.("NapCat plugin active. Listening on /napcat");
             console.log("[NapCat] Plugin active. Listening on /napcat");
+            // Reclaims reply contexts for groups that went quiet; stopped with the account so
+            // the timer never outlives the plugin.
+            const stopGroupReplyContextSweeper = startNapCatGroupReplyContextSweeper();
             return waitUntilAbort(ctx?.abortSignal, () => {
+                stopGroupReplyContextSweeper();
                 ctx?.log?.info?.("NapCat plugin stopped");
                 console.log("[NapCat] Plugin stopped");
             });
